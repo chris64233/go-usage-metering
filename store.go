@@ -61,6 +61,71 @@ CREATE TABLE IF NOT EXISTS corrections (
 );
 CREATE INDEX IF NOT EXISTS idx_corrections_event ON corrections (tenant, event_id);
 CREATE INDEX IF NOT EXISTS idx_corrections_period ON corrections (tenant, period_start_unix);
+
+-- 费率版本：按 (租户, 计量项, 生效时刻) 发布，发布后不可修改。
+-- 同一 (租户, 计量项, 生效时刻) 只允许一份版本（唯一索引），因此任一时刻
+-- “生效时间 <= 该时刻”的最新版本唯一，不存在两份费率在同一时刻同时有效。
+CREATE TABLE IF NOT EXISTS rate_versions (
+	tenant              TEXT    NOT NULL,
+	meter               TEXT    NOT NULL,
+	version             INTEGER NOT NULL, -- (租户, 计量项) 内单调分配，从 1 开始
+	effective_from_unix INTEGER NOT NULL, -- 生效起点（含），按发生时间选择版本
+	tiers_json          TEXT    NOT NULL, -- 分段价格不可变副本（JSON）
+	currency            TEXT    NOT NULL,
+	quantity_scale      INTEGER NOT NULL, -- 数量计价精度（小数位）
+	amount_scale        INTEGER NOT NULL, -- 金额计价精度（小数位）
+	published_at_unix   INTEGER NOT NULL,
+	PRIMARY KEY (tenant, meter, version)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_rate_effective
+	ON rate_versions (tenant, meter, effective_from_unix);
+
+-- 账单草稿版本。每个周期可有多个历史版本（作废后保留），但至多一个 current：
+-- 部分唯一索引（仅 status='current' 的行参与周期唯一约束）。
+CREATE TABLE IF NOT EXISTS drafts (
+	tenant              TEXT    NOT NULL,
+	period_start_unix   INTEGER NOT NULL,
+	version             INTEGER NOT NULL, -- 周期内单调递增，从 1 开始
+	status              TEXT    NOT NULL, -- 'current' 或 'voided'
+	boundary_seq        INTEGER NOT NULL, -- 冻结的关账提交边界（快照副本）
+	total_amount        TEXT    NOT NULL, -- 全部明细金额之和（精确）
+	currency            TEXT    NOT NULL,
+	created_at_unix     INTEGER NOT NULL,
+	voided_at_unix      INTEGER NOT NULL DEFAULT 0,
+	PRIMARY KEY (tenant, period_start_unix, version)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_draft_current
+	ON drafts (tenant, period_start_unix) WHERE status = 'current';
+
+-- 草稿计价明细：一行对应快照范围内一条事件或修正。
+-- 行不可变且整体从属于一个草稿版本：并发重算时每个调整只会出现在一个版本里。
+CREATE TABLE IF NOT EXISTS draft_lines (
+	tenant            TEXT    NOT NULL,
+	period_start_unix INTEGER NOT NULL,
+	draft_version     INTEGER NOT NULL,
+	line_seq          INTEGER NOT NULL, -- 草稿内稳定排序
+	kind              TEXT    NOT NULL, -- 'event' / 'correction'
+	ref_id            TEXT    NOT NULL, -- 事件号或修正号
+	event_id          TEXT    NOT NULL, -- 原始事件号
+	meter             TEXT    NOT NULL,
+	is_adjustment     INTEGER NOT NULL, -- 是否迟到顺延数据（在草稿中单列）
+	origin_period_start_unix INTEGER NOT NULL, -- 调整项本应归属的原周期；0 表示非调整项或无更早周期
+	occurred_at_unix  INTEGER NOT NULL, -- 计价所依据的发生时间
+	quantity          TEXT    NOT NULL, -- 计价数量（修正为有符号增量）
+	rate_version      INTEGER NOT NULL, -- 适用的费率版本号
+	rate_effective_at_unix INTEGER NOT NULL, -- 该费率版本的生效时间
+	pricing_json      TEXT    NOT NULL, -- 冻结的费率副本（tiers/scale/currency）
+	unit_amount       TEXT    NOT NULL, -- 分段计价后的单价（摊回，仅供展示）
+	amount            TEXT    NOT NULL, -- 计价金额（修正按有符号数量计价，可为负）
+	PRIMARY KEY (tenant, period_start_unix, draft_version, line_seq),
+	UNIQUE (tenant, period_start_unix, draft_version, kind, ref_id),
+	FOREIGN KEY (tenant, period_start_unix, draft_version)
+		REFERENCES drafts (tenant, period_start_unix, version)
+);
+CREATE INDEX IF NOT EXISTS idx_draft_lines_ref
+	ON draft_lines (tenant, period_start_unix, kind, ref_id);
+CREATE INDEX IF NOT EXISTS idx_draft_lines_meter
+	ON draft_lines (tenant, period_start_unix, draft_version, meter, is_adjustment);
 `
 
 // openDB 打开（必要时创建）一个计量服务存储。

@@ -19,6 +19,15 @@ const (
 	CodeBelowFloor ErrorCode = "below_floor"
 	// CodePeriodClosed 目标周期已经关闭，不能再被改写（迟到数据请走下一周期调整项）。
 	CodePeriodClosed ErrorCode = "period_closed"
+	// CodePeriodOpen 目标周期尚未关闭；账单草稿只能在周期关闭（快照定稿）后生成。
+	CodePeriodOpen ErrorCode = "period_open"
+	// CodeRateOverlap 同一租户、同一计量项在同一生效时刻已存在费率版本；
+	// 任一时刻适用费率必须唯一，不允许两份费率在同一时刻同时生效。
+	CodeRateOverlap ErrorCode = "rate_overlap"
+	// CodeNoApplicableRate 草稿计价时，某计量项在用量发生时刻没有任何已生效费率版本。
+	CodeNoApplicableRate ErrorCode = "no_applicable_rate"
+	// CodeVersionConflict 草稿版本冲突：例如要求作废的版本与当前版本不一致。
+	CodeVersionConflict ErrorCode = "version_conflict"
 	// CodeInternal 存储层或其它内部故障。
 	CodeInternal ErrorCode = "internal"
 )

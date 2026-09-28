@@ -120,3 +120,62 @@ const (
 	KindEvent      = "event"
 	KindCorrection = "correction"
 )
+
+// DraftLine 是账单草稿中的一条计价明细，对应快照范围内的一条事件或修正。
+type DraftLine struct {
+	// Kind 取值 "event"（原始事件）或 "correction"（修正增量）。
+	Kind string
+	// RefID 事件号（Kind=event）或修正号（Kind=correction）。
+	RefID string
+	// EventID 对应的原始事件号（事件明细即其自身）。
+	EventID string
+	Meter   string
+	// Adjustment 为 true 表示该明细来自顺延到本周期的迟到数据，在草稿中单列。
+	Adjustment bool
+	// OriginPeriodStart 调整项按发生时间本应归属的原周期起点；非调整项为零值，
+	// 早于系统内最早周期的调整项也为零值。
+	OriginPeriodStart time.Time
+	// OccurredAt 计价依据时间：事件为其发生时间；修正一律按“原事件发生时间”取费率
+	// （迟到修正也使用原事件发生时的费率版本，而非修正提交或发生时间的费率）。
+	OccurredAt time.Time
+	// Quantity 计价数量；修正为有符号增量，金额随之可负。
+	Quantity decimal.Decimal
+	// RateVersion 该明细解析并冻结的费率版本号。
+	RateVersion int32
+	// RateEffectiveFrom 适用费率版本的生效时间。
+	RateEffectiveFrom time.Time
+	// UnitAmount 分段计价摊回的单价（Amount/Quantity），仅供展示。
+	UnitAmount decimal.Decimal
+	// Amount 该行计价金额（精确计算、按金额精度取整后的不可变结果）。
+	Amount decimal.Decimal
+}
+
+// Draft 是一个已关闭周期的账单草稿版本。
+//
+// 一个周期可以有多个版本：作废后重新生成会产生新版本号，旧版本及其明细继续保留；
+// 同一周期至多一个 status=current 的版本。草稿内容（快照边界、适用费率副本、
+// 逐条计价明细、总额）在生成时冻结，之后即使发布/补发新费率也不会被改写。
+type Draft struct {
+	Tenant      string
+	PeriodStart time.Time
+	PeriodEnd   time.Time
+	// Version 周期内单调递增的草稿版本号，从 1 开始。
+	Version int32
+	// Status 取值 DraftStatusCurrent / DraftStatusVoided。
+	Status string
+	// BoundarySeq 冻结的关账提交边界；明细只覆盖 commit_seq <= 该值的快照数据。
+	BoundarySeq int64
+	Currency    string
+	// TotalAmount 全部明细 Amount 精确求和（normal + adjustment）。
+	TotalAmount decimal.Decimal
+	// NormalAmount 非调整项明细金额之和。
+	NormalAmount decimal.Decimal
+	// AdjustmentAmount 迟到调整项明细金额之和（草稿中单列）。
+	AdjustmentAmount decimal.Decimal
+	// Lines 稳定排序的全部计价明细（正常项在前、调整项在后）。
+	Lines []DraftLine
+	// CreatedAt 版本生成时间。
+	CreatedAt time.Time
+	// VoidedAt 作废时间；当前版本为零值。
+	VoidedAt time.Time
+}
