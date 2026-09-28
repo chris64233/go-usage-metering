@@ -120,3 +120,112 @@ const (
 	KindEvent      = "event"
 	KindCorrection = "correction"
 )
+
+// PriceTier 是费率中的一个分段：落在 (上一段上限, UpperQuantity] 区间内的数量
+// 按 UnitPrice 单价累进计价；UpperQuantity 为 nil 表示开口分段（+∞）。
+type PriceTier struct {
+	// UpperQuantity 本分段的数量上限（含）；nil 表示开口分段，必须位于末段。
+	UpperQuantity *decimal.Decimal
+	// UnitPrice 本分段单价，不得为负。
+	UnitPrice decimal.Decimal
+}
+
+// RateVersion 是按租户、计量项与生效时间发布的费率版本，发布后不可变。
+//
+// 同一 (租户, 计量项) 下，生效时间最大且不晚于用量发生时间的版本即为该时刻的
+// 适用费率；同一生效时间只允许存在一个版本（否则同一时刻会有两份有效费率）。
+type RateVersion struct {
+	// VersionID 外部费率版本号，租户内唯一、幂等。
+	VersionID string
+	Tenant    string
+	Meter     string
+	// EffectiveAt 生效时间（含），UTC。
+	EffectiveAt time.Time
+	// Tiers 分段价格，按上限严格递增排列，末段必须开口。
+	Tiers []PriceTier
+	// AmountScale 计价精度：金额保留的小数位数（四舍五入，半数远离零）。
+	AmountScale int32
+	// PublishedAt 发布落库时间（UTC）。
+	PublishedAt time.Time
+}
+
+// 草稿版本状态。
+const (
+	// StatusCurrent 当前草稿版本：同一周期同一时刻至多一个。
+	StatusCurrent = "current"
+	// StatusVoided 已作废版本：只保留历史，不再是当前草稿。
+	StatusVoided = "voided"
+)
+
+// PricedSegment 是一条明细在单个费率分段内的计价过程（未舍入的精确值）。
+type PricedSegment struct {
+	TierIndex int
+	// Quantity 落入该分段的数量（非负）。
+	Quantity decimal.Decimal
+	// UnitPrice 该分段单价（冻结自适用费率版本）。
+	UnitPrice decimal.Decimal
+	// RawAmount 该分段金额 = Quantity * UnitPrice，未舍入。
+	RawAmount decimal.Decimal
+}
+
+// BillLine 是账单草稿中的一条计价明细，生成时整体冻结，之后永不改变。
+type BillLine struct {
+	// LineSeq 版本内行号，按提交序号稳定排序。
+	LineSeq int
+	// Kind 取值 "event" 或 "correction"。
+	Kind string
+	// RefID 事件号（Kind=event）或修正号（Kind=correction）。
+	RefID string
+	// EventID 对应的原始事件号（事件行即其自身）。
+	EventID string
+	Meter   string
+	// Adjustment 为 true 表示迟到调整行（发生时间属于更早周期、顺延到本周期承载）。
+	Adjustment bool
+	// OriginPeriodStart 调整行按发生时间本应归属的周期；非调整行为零值。
+	OriginPeriodStart time.Time
+	// OccurredAt 该行用量自身的业务发生时间。
+	OccurredAt time.Time
+	// Quantity 计价数量（修正可为负；按其绝对值分段计价后再恢复符号）。
+	Quantity decimal.Decimal
+
+	// RateVersionID 本行适用的费率版本号。
+	RateVersionID string
+	// RateEffectiveAt 适用费率的生效时间。
+	RateEffectiveAt time.Time
+	// Tiers 冻结自适用费率版本的分段价格副本。
+	Tiers []PriceTier
+	// AmountScale 冻结自适用费率版本的计价精度。
+	AmountScale int32
+	// Segments 分段计价过程（精确值）。
+	Segments []PricedSegment
+	// Amount 本行金额：分段精确金额合计后按 AmountScale 四舍五入。
+	Amount decimal.Decimal
+
+	// CommitSeq 该行来源数据的提交序号。
+	CommitSeq int64
+}
+
+// BillVersion 是某周期账单草稿的一个版本。
+type BillVersion struct {
+	Tenant      string
+	PeriodStart time.Time
+	// PeriodEnd 生成时冻结的周期终点；生成时周期仍开放则为零值。
+	PeriodEnd time.Time
+	// Version 版本号，同一周期内从 1 单调递增。
+	Version int
+	// Status 取值 StatusCurrent 或 StatusVoided。
+	Status string
+	// PeriodClosed 生成该版本时周期是否已关闭（冻结的周期状态）。
+	PeriodClosed bool
+	// BoundarySeq 冻结的提交边界：仅 commit_seq <= 该值且由本周期承载的行计入。
+	BoundarySeq int64
+	// SnapshotQuantities 冻结的周期用量数量快照（按计量项合计，含全部来源与调整行）。
+	SnapshotQuantities map[string]decimal.Decimal
+	// TotalAmount 金额合计 = Lines 各行 Amount 精确求和（等于全部明细之和）。
+	TotalAmount decimal.Decimal
+	// Lines 冻结的计价明细，按 LineSeq 排序。
+	Lines []BillLine
+
+	CreatedAt time.Time
+	VoidedAt  time.Time
+}

@@ -61,6 +61,108 @@ CREATE TABLE IF NOT EXISTS corrections (
 );
 CREATE INDEX IF NOT EXISTS idx_corrections_event ON corrections (tenant, event_id);
 CREATE INDEX IF NOT EXISTS idx_corrections_period ON corrections (tenant, period_start_unix);
+
+-- 费率版本：按 (租户, 计量项, 生效时间) 发布，发布后不可变。
+-- (tenant, meter, effective_at_unix) 唯一：同一时刻不允许两份有效费率（时间区间重叠）。
+CREATE TABLE IF NOT EXISTS rate_versions (
+	version_id           TEXT    NOT NULL,
+	tenant               TEXT    NOT NULL,
+	meter                TEXT    NOT NULL,
+	effective_at_unix    INTEGER NOT NULL,
+	amount_scale         INTEGER NOT NULL,
+	published_at_unix    INTEGER NOT NULL,
+	PRIMARY KEY (tenant, version_id),
+	UNIQUE (tenant, meter, effective_at_unix)
+);
+CREATE INDEX IF NOT EXISTS idx_rates_lookup
+	ON rate_versions (tenant, meter, effective_at_unix);
+
+-- 费率分段价格：属于某个费率版本，按 tier_index 排序。
+-- upper_quantity 为 NULL 表示开口分段（必须位于末段）。
+CREATE TABLE IF NOT EXISTS rate_tiers (
+	tenant          TEXT    NOT NULL,
+	version_id      TEXT    NOT NULL,
+	tier_index      INTEGER NOT NULL,
+	upper_quantity  TEXT,            -- NULL = +∞
+	unit_price      TEXT    NOT NULL,
+	PRIMARY KEY (tenant, version_id, tier_index),
+	FOREIGN KEY (tenant, version_id) REFERENCES rate_versions (tenant, version_id)
+);
+
+-- 账单草稿版本：同一周期可有多个版本，仅一个 current（见部分唯一索引）。
+CREATE TABLE IF NOT EXISTS bill_versions (
+	tenant             TEXT    NOT NULL,
+	period_start_unix  INTEGER NOT NULL,
+	version            INTEGER NOT NULL,
+	status             TEXT    NOT NULL,
+	period_end_unix    INTEGER NOT NULL, -- 生成时冻结；0 表示生成时周期仍开放
+	period_closed      INTEGER NOT NULL,
+	boundary_seq       INTEGER NOT NULL,
+	total_amount       TEXT    NOT NULL, -- 各行金额精确求和
+	idempotency_key    TEXT    NOT NULL, -- 生成时的幂等键；同键重放返回同一版本
+	created_at_unix    INTEGER NOT NULL,
+	voided_at_unix     INTEGER NOT NULL DEFAULT 0,
+	PRIMARY KEY (tenant, period_start_unix, version),
+	FOREIGN KEY (tenant, period_start_unix) REFERENCES periods (tenant, start_unix)
+);
+CREATE INDEX IF NOT EXISTS idx_bill_versions_period
+	ON bill_versions (tenant, period_start_unix, version);
+-- 每个周期至多一个当前草稿版本。
+CREATE UNIQUE INDEX IF NOT EXISTS idx_bill_one_current
+	ON bill_versions (tenant, period_start_unix)
+	WHERE status = 'current';
+
+-- 草稿的周期数量快照（按计量项冻结）。
+CREATE TABLE IF NOT EXISTS bill_snapshot_lines (
+	tenant             TEXT    NOT NULL,
+	period_start_unix  INTEGER NOT NULL,
+	version            INTEGER NOT NULL,
+	meter              TEXT    NOT NULL,
+	quantity           TEXT    NOT NULL,
+	PRIMARY KEY (tenant, period_start_unix, version, meter),
+	FOREIGN KEY (tenant, period_start_unix, version)
+		REFERENCES bill_versions (tenant, period_start_unix, version)
+);
+
+-- 草稿计价明细：生成时整体冻结，并冻结当时适用的费率版本号。
+CREATE TABLE IF NOT EXISTS bill_lines (
+	tenant                    TEXT    NOT NULL,
+	period_start_unix         INTEGER NOT NULL,
+	version                   INTEGER NOT NULL,
+	line_seq                  INTEGER NOT NULL,
+	kind                      TEXT    NOT NULL,
+	ref_id                    TEXT    NOT NULL,
+	event_id                  TEXT    NOT NULL,
+	meter                     TEXT    NOT NULL,
+	is_adjustment             INTEGER NOT NULL,
+	origin_period_start_unix  INTEGER NOT NULL,
+	occurred_at_unix          INTEGER NOT NULL,
+	quantity                  TEXT    NOT NULL,
+	rate_version_id           TEXT    NOT NULL,
+	rate_effective_at_unix    INTEGER NOT NULL,
+	amount_scale              INTEGER NOT NULL,
+	amount                    TEXT    NOT NULL,
+	commit_seq                INTEGER NOT NULL,
+	PRIMARY KEY (tenant, period_start_unix, version, line_seq),
+	UNIQUE (tenant, period_start_unix, version, kind, ref_id)
+);
+CREATE INDEX IF NOT EXISTS idx_bill_lines_rate
+	ON bill_lines (tenant, meter, rate_version_id);
+
+-- 一条明细在各费率分段上的计价过程（冻结，便于审计计价明细）。
+CREATE TABLE IF NOT EXISTS bill_line_segments (
+	tenant             TEXT    NOT NULL,
+	period_start_unix  INTEGER NOT NULL,
+	version            INTEGER NOT NULL,
+	line_seq           INTEGER NOT NULL,
+	tier_index         INTEGER NOT NULL,
+	quantity           TEXT    NOT NULL,
+	unit_price         TEXT    NOT NULL,
+	raw_amount         TEXT    NOT NULL,
+	PRIMARY KEY (tenant, period_start_unix, version, line_seq, tier_index),
+	FOREIGN KEY (tenant, period_start_unix, version, line_seq)
+		REFERENCES bill_lines (tenant, period_start_unix, version, line_seq)
+);
 `
 
 // openDB 打开（必要时创建）一个计量服务存储。

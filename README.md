@@ -1,12 +1,14 @@
 # go-usage-metering
 
-带**修正记录**与**结算截点**的用量计量 Go 服务。支持幂等事件上报、增量修正、
-结算周期关闭与不可变快照，并在上报/关闭并发下保证每条数据有且仅有一个周期归属；
-周期关闭后到达的迟到数据进入下一周期调整项，旧快照永不被改写。
+带**修正记录**、**结算截点**、**费率版本**与**账单草稿**的用量计量 Go 服务。
+支持幂等事件上报、增量修正、结算周期关闭与不可变快照，并在上报/关闭并发下保证
+每条数据有且仅有一个周期归属；周期关闭后到达的迟到数据进入下一周期调整项，旧快照永不被改写。
+在此基础上支持按租户/计量项/生效时间发布不可变分段费率，按周期生成**版本化、整体冻结**的
+账单草稿（含适用费率副本与逐条计价明细），支持作废重算与计价明细审计。
 
 - 语言版本：Go 1.23.0
 - 存储：SQLite（纯 Go 驱动 [modernc.org/sqlite](https://pkg.go.dev/modernc.org/sqlite)），自动建表迁移
-- 精确数量：[shopspring/decimal](https://pkg.go.dev/github.com/shopspring/decimal)，规范文本落库，无浮点误差
+- 精确数量与金额：[shopspring/decimal](https://pkg.go.dev/github.com/shopspring/decimal)，规范文本落库，无浮点误差
 
 ## 能力与规则
 
@@ -79,6 +81,63 @@
 
 SQLite 连接池被限制为单连接并开启 WAL 与外键约束；数据持久化到文件，重开不丢。
 
+### 7. 费率版本（不可变、分段计价）
+
+费率版本按 **租户 + 计量项 + 生效时间** 发布，发布后不可修改（无更新/删除入口）：
+
+| 字段 | 说明 |
+| --- | --- |
+| `VersionID` | 外部版本号，**租户内唯一、幂等** |
+| `Tenant` / `Meter` | 租户与计量项 |
+| `EffectiveAt` | 生效时间（**含该时刻**），UTC |
+| `Tiers` | 分段累进价格；上限严格递增，末段必须开口（`UpperQuantity = nil`） |
+| `AmountScale` | 计价金额小数位（四舍五入、半数远离零），范围 `[0,18]` |
+
+- **适用费率选择**：某计量项在用量发生时刻 `t` 的费率，取生效时间最大且 `EffectiveAt <= t` 的版本。
+- **时间区间不重叠**：同一计量项在同一生效时间只允许一个版本，否则该时刻会有两份有效费率，
+  返回 `rate_overlap`。不同生效时间发布新版本即“费率修订”，旧版本原样保留。
+- 版本号幂等：同号同内容返回首次结果；同号不同内容返回 `conflict`。
+- **计价口径**：数量按绝对值切分到各分段（`(上段上限, 本段上限]` 按本段单价），
+  负数量（修正）先按绝对值计价再恢复符号；分段金额精确求和后按 `AmountScale` 一次性舍入。
+
+### 8. 账单草稿（版本化、整体冻结）
+
+`GenerateBill(tenant, periodStart, idempotencyKey)` 为周期生成草稿版本 `BillVersion`，
+生成时一次性冻结：
+
+- **周期快照**：提交边界 `BoundarySeq`、生成时周期是否已关闭（`PeriodClosed`）与周期终点、
+  按计量项汇总的用量数量 `SnapshotQuantities`；
+- **适用费率**：每条明细冻结所选费率版本号、生效时间与分段价格副本；
+- **计价明细 `Lines`**：逐行记录数量、分段计价过程 `Segments`、舍入后金额 `Amount`；
+- **金额合计 `TotalAmount`**：各行金额用十进制精确求和，**恒等于全部明细之和**。
+
+边界口径与关账一致：仅“由本周期承载且 `commit_seq <= BoundarySeq`”的行计入；
+周期已关闭用关账边界，开放周期则用生成时刻的当前最大提交序号。
+
+- **幂等**：同幂等键重复生成返回同一版本；不同键再次请求当前已存在草稿时返回 `bill_conflict`，
+  避免不同调用方在不知情下触发重算。
+- **冻结不可改写**：草稿生成后再发布/修订费率，或再到达迟到用量，都不会改变该草稿。
+  迟到用量进入下一周期调整行，绝不直接塞进旧周期。
+- **开放周期也可出草稿**：此时 `PeriodClosed=false`、`PeriodEnd` 为零值，先冻结一版预账单。
+
+### 9. 迟到调整的计价
+
+顺延到下一周期的迟到数据在草稿中**单列**（`Adjustment=true`），并保留
+`EventID` 与 `OriginPeriodStart` 来源关联：
+
+- 迟到**事件**调整行按其自身发生时间选择费率；
+- 迟到**修正**调整行引用原事件与原周期，**金额按“原事件发生时”的费率计算**，
+  而不是修正自身业务时间或提交时间——即使修正发生时已有更新的费率版本。
+
+### 10. 作废与重算
+
+- `VoidBill` 把当前版本置为 `voided`（旧版本及其明细继续保留，可按版本号查询）；
+- 之后再次 `GenerateBill` 生成新版本号（版本号在周期内单调递增、不复用）；
+- **并发重算**由数据库部分唯一索引保证：同一周期同一时刻只有一个版本成为 `current`，
+  竞争失败方收到 `bill_conflict`，可重新读取当前草稿；
+- **修正与生成并发**：冻结边界把每笔修正二分到唯一一个草稿版本——
+  `commit_seq <= 边界` 的修正恰好进入一次，其余不进入，作废重算后的新版本才纳入全部修正。
+
 ## 快速开始
 
 ```go
@@ -142,6 +201,41 @@ func main() {
 	// 关闭后到达的迟到事件自动进入下一周期调整项，可查询来源关联。
 	adj, err := svc.ListAdjustments(ctx, "tenant-a", monthEnd)
 	_ = adj
+
+	// 发布分段费率（示例：0~100 单价 1，100~200 单价 2，200 以上单价 3；金额保留 2 位）。
+	hundred := decimal.RequireFromString("100")
+	twoHundred := decimal.RequireFromString("200")
+	if _, err := svc.PublishRate(ctx, usagemetering.RateInput{
+		VersionID:   "rate-2026-01",
+		Tenant:      "tenant-a",
+		Meter:       "storage_gb",
+		EffectiveAt: monthStart,
+		Tiers: []usagemetering.TierInput{
+			{UpperQuantity: &hundred, UnitPrice: decimal.RequireFromString("1")},
+			{UpperQuantity: &twoHundred, UnitPrice: decimal.RequireFromString("2")},
+			{UnitPrice: decimal.RequireFromString("3")}, // 末段开口
+		},
+		AmountScale: 2,
+	}); err != nil {
+		panic(err)
+	}
+
+	// 生成账单草稿（须带幂等键）；冻结快照、适用费率与逐条计价明细。
+	bill, err := svc.GenerateBill(ctx, usagemetering.GenerateBillInput{
+		Tenant:         "tenant-a",
+		PeriodStart:    monthStart,
+		IdempotencyKey: "bill-run-001",
+	})
+	if err != nil {
+		panic(err)
+	}
+	// bill.TotalAmount == 全部明细 Amount 之和（精确十进制）。
+	// 之后新费率发布或迟到用量都不会改写本版草稿；需要重算时先 VoidBill。
+
+	// 作废当前草稿；旧版本及明细保留，随后可重新生成新版本。
+	if _, err := svc.VoidBill(ctx, "tenant-a", monthStart); err != nil {
+		panic(err)
+	}
 }
 ```
 
@@ -156,6 +250,15 @@ func main() {
 | `ClosePeriod(ctx, tenant, start, end)` | 关闭周期并生成快照；重复关闭返回原快照 |
 | `GetSnapshot(ctx, tenant, start)` | 查询已关闭周期的不可变快照 |
 | `ListAdjustments(ctx, tenant, periodStart)` | 查询某周期承载的迟到调整项（按提交序排序） |
+| `PublishRate(ctx, RateInput)` | 发布不可变费率版本；幂等、重叠报 `rate_overlap` |
+| `GetRateVersion(ctx, tenant, versionID)` | 按版本号查询费率（含分段价格） |
+| `ListRateVersions(ctx, tenant, meter)` | 列出租户/计量项已发布版本（按生效时间排序） |
+| `GenerateBill(ctx, GenerateBillInput)` | 生成/重算版本化账单草稿；同键幂等，异键报 `bill_conflict` |
+| `GetCurrentBill(ctx, tenant, periodStart)` | 查询当前草稿版本 |
+| `GetBillVersion(ctx, tenant, periodStart, v)` | 查询指定版本（含已作废版本及其明细） |
+| `ListBillVersions(ctx, tenant, periodStart)` | 列出某周期全部版本（含 voided） |
+| `VoidBill(ctx, tenant, periodStart)` | 作废当前版本；重复作废/无当前版本报 `bill_conflict` |
+| `ListBillLines(ctx, tenant, periodStart, v)` | 查询指定版本的计价明细（含分段过程） |
 | `GetPeriod` / `GetEvent` / `GetCorrection` | 单对象查询 |
 
 ## 错误分类
@@ -165,10 +268,13 @@ func main() {
 
 | Code | 触发场景 |
 | --- | --- |
-| `invalid_argument` | 缺字段、负数量/负下限、终点不晚于起点、周期不连续等 |
-| `not_found` | 周期/事件/原事件/快照不存在 |
-| `conflict` | 事件号或修正号已存在但内容不同；重复关闭终点不一致；已存在开放周期 |
+| `invalid_argument` | 缺字段、负数量/负下限、终点不晚于起点、周期不连续、费率分段非法/精度越界等 |
+| `not_found` | 周期/事件/原事件/快照/费率/草稿版本不存在 |
+| `conflict` | 事件号/修正号/费率版本号已存在但内容不同；重复关闭终点不一致；已存在开放周期 |
 | `below_floor` | 修正后累计数量低于业务下限（错误信息含原值、历史增量、本次增量与累计值） |
+| `rate_overlap` | 同一计量项在同一生效时间已存在版本（同一时刻两份有效费率） |
+| `no_rate` | 有用量在其（或原事件）发生时刻之前从未发布过适用费率，无法计价 |
+| `bill_conflict` | 异键重复生成、重复作废/无当前版本作废、并发重算竞争当前版本失败 |
 | `period_closed` | 预留给直接改写已关闭周期的场景（当前写路径自动顺延，不会产生） |
 | `internal` | 存储层等内部故障 |
 
@@ -178,6 +284,13 @@ func main() {
 - `periods`：周期（起止、关闭标志、关账边界、关闭时间）。
 - `events`：事件（幂等键、发生时间、规范数量文本、提交序号、承载周期、调整标记与来源周期）。
 - `corrections`：修正（幂等键、原事件外键、增量、下限、承载周期、调整标记与来源周期）。
+- `rate_versions`：费率版本主表（`(tenant, meter, effective_at)` 唯一以防重叠）。
+- `rate_tiers`：费率分段价格（上限可空表示开口段、单价）。
+- `bill_versions`：草稿版本（状态、冻结的周期状态/边界/终点、幂等键、合计）；
+  部分唯一索引保证每周期仅一个 `current`。
+- `bill_snapshot_lines`：草稿冻结的周期数量快照（按计量项）。
+- `bill_lines`：草稿逐条计价明细（数量、所选费率版本号、冻结精度、金额、来源关联）。
+- `bill_line_segments`：明细在各费率分段上的计价过程（数量、单价、未舍入金额）。
 
 时间一律以 UTC 纳秒时间戳存储；decimal 以 `String()` 规范文本存储。
 
@@ -191,4 +304,10 @@ go test -race ./...      # 带竞态检测（CI 建议）
 测试覆盖：事件幂等/冲突与校验、修正增量/幂等/冲突/自定义下限/跨周期下限、
 快照精确合计、重复与并发关闭只产生一个结果、迟到事件与迟到修正进入下一周期调整项、
 提前上报数据按发生时间移交、上报与关闭高并发下的归属不重不漏（总量配平 +
-逐行归属计数）、租户隔离、文件库关闭重开后的精度与状态保持。
+逐行归属计数）、租户隔离、文件库关闭重开后的精度与状态保持；
+**费率发布**（幂等/冲突/重叠/分段校验/排序）、**分段累进计价**（跨段切分、精度舍入、
+负数量符号）、**草稿生成**（按发生时间选费率、无可用费率报错不留残、开放/关闭周期、
+金额恒等于明细之和）、**幂等冻结**（异键冲突、后发布费率与迟到用量不改写旧草稿）、
+**迟到修正按原事件费率计价且单列**、**作废重算**（版本保留、版本号单调）、
+**并发重算仅一个当前版本**、**修正与生成并发下边界二分不重不漏**、
+费率与草稿明细跨重开持久化。
